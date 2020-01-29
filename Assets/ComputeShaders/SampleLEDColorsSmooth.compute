@@ -1,0 +1,252 @@
+﻿#pragma kernel SampleLEDColors
+
+// 스레드 그룹의 스레드 사이즈
+#define BLOCK_SIZE 256
+
+#define M_PI 3.1415926535897932384626433832795
+#define  epsilon 1e-3 
+
+
+// 보이드 구조체
+
+struct Boid
+{
+	//float3 wallOrigin; // the reference position of the wall (the boid reference frame) on which the boid is 
+	//float3  eulerAngles; // the rotation of the boid reference frame
+	float4x4 boidFrame;
+	float3   normal;
+	float3  position; // the position of the  boid in the boid reference frame
+	float3  scale;
+	float3  headDir; // the head angle of the  boid on the local plane: from 0 to 2 *PI
+	float speed;            // the speed of a boid
+
+	float  radius; // the radius of a circle boid; //not directly used
+	float3 colorHSL; // HSL color
+	float4 color;         // RGBA color
+	float2 soundGrain; //        the freq (pitch) and amp of the boid sound grain
+	float duration; //   the duration of the boid for one frame. 
+	int   wallNo;    // the number of the wall on which the boid is 
+	
+
+};
+
+struct BoidLEDData
+{
+	// public Vector3  WallOrigin; // the reference position of the wall (the boid reference frame) on which the boid is 
+
+	//public Vector3 EulerAngles; // the rotation of the boid reference frame
+	 float4x4 boidFrame;
+	 float3 position; //
+	 float3 headDir; // heading direction of the boid on the local plane
+	 float4 color;         // RGBA color
+	 float3 scale;
+	 int wallNo;      // the number of the wall whose boids defined the light sources of the branch cylinder
+							// 0=> the inner  circular wall. 
+							// 1 => the outer circular wall;
+	 int nearestBoidID;
+	 int  neighborCount;
+};
+
+//
+//public struct BoidLEDData
+//{
+//
+//	public Vector3 Position; //
+//	public Vector3 HeadDir; // heading direction of the boid on the local plane
+//	public Vector4 Color;         // RGBA color
+//	public Vector3 Scale;
+//	public int WallNo;      // the number of the wall whose boids defined the light sources of the branch cylinder
+//							// 0=> the inner  circular wall. 
+//							// 1 => the outer circular wall;
+//}
+// 보이드 데이터 버퍼
+
+//
+//public struct BoidLEDDebugData
+//{
+//	// public Vector3  WallOrigin; // the reference position of the wall (the boid reference frame) on which the boid is 
+//
+//	//public Vector3 EulerAngles; // the rotation of the boid reference frame
+//	public int BoidLEDID; // the position of the  boid in the boid reference frame        
+//
+//	public int  NearestBoidID; // the scale factors
+//	public int  NeighborCount; // heading direction of the boid on the local plane
+//	public float NeighborRadius; // the radius of the circle boid
+//	public Vector4 NearestBoidColor;         // RGBA color
+//	public Vector4 AvgColor;         // RGBA color
+//
+//}
+
+
+struct BoidLEDRenderDebugData
+{
+	// public Vector3  WallOrigin; // the reference position of the wall (the boid reference frame) on which the boid is 
+
+	//public Vector3 EulerAngles; // the rotation of the boid reference frame
+	int boidLEDID; // the position of the  boid in the boid reference frame        
+
+	int  nearestBoidID; // the scale factors
+	int  neighborCount; // heading direction of the boid on the local plane
+	float neighborRadius; // the radius of the circle boid
+	float4 nearestBoidColor;         // RGBA color
+	float4  avgColor;         // RGBA color
+
+};
+
+
+
+
+StructuredBuffer<Boid> _BoidBuffer;
+RWStructuredBuffer<BoidLEDData> _BoidLEDBuffer;
+
+RWStructuredBuffer<BoidLEDRenderDebugData> _BoidLEDRenderDebugBuffer;
+
+RWStructuredBuffer<float4> _BoidLEDRenderDebugBuffer0;
+
+
+float _SamplingRadius;
+
+float  _Hemisphere;
+int  _ColorSamplingMethod;
+
+float _CeilingInnerRadius; // minimum ceiling radius used as the min radius for both ground and ceililing
+float _MaxDomainRadius; // 10
+//float _MinDomainRadius; // 0.7
+
+float _MaxChainRadius; // 2 m
+float _MinChainRadius;  // 0.7 m
+
+int _BoidsNum;
+int _NumOfWalls;
+
+
+
+float findPhiAngleForVector(float3 vec)
+{
+
+	// get the ground projection of vec along y axis
+	float theta = atan2(vec.z, vec.x); // theta ranges (0,pi) or (0 -pi)
+
+	if (theta < 0) { // negative theta means that vec (x,y) is in 3rd or 4th quadrant, measuring in the clockwise direction
+		return (2 * M_PI + theta); // angle measured in the counterclockwise direction
+	}
+	else {
+		return theta;
+	}
+
+}
+
+  // Use a single boid buffer for the ceiling and the ground, 
+  // but use a flag to indicate whether the boid is on the ground or on the ceiling
+
+  //https://msdn.microsoft.com/ko-kr/library/windows/desktop/ff471442(v=vs.85).aspx
+[numthreads(BLOCK_SIZE, 1, 1)]
+void SampleLEDColors(uint3 DTid : SV_DispatchThreadID)
+{
+	// Process a SINGLE Boid refered to by DTid.x
+
+	int pId = DTid.x;
+
+	BoidLEDData pBoidLED = _BoidLEDBuffer[pId];
+
+
+	int neighborCnt = 0;
+
+
+	float4 colorSum = (float4)0.0;
+	float4 avgColor = (float4)0.0;
+
+	float  weightSum = (float)0.0;
+
+	float weight, dist;
+	float3 diffVec;
+
+
+
+	// apply three boid rules using neighbors
+
+
+	//float minDist = _SamplingRadius ; // 0.05 m = 5cm;
+
+
+	float minDist = _MaxDomainRadius * 0.2 ; // 10 m * 0.1 = 1m;
+
+	int minIndex = -1;
+
+	// Get the boid whose radius from the y axis is "equal" to the radius of pLEDBoid
+	// Sample the color of that boid as the color of pLEDBoid
+	float3 LEDBoidPosFromYAxis = float3(pBoidLED.position.x, 0.0, pBoidLED.position.z);
+	float LEDBoidRadiusFromYAxis = length(LEDBoidPosFromYAxis);
+
+	// realRadius: scaledRadius = radiusOfLEDPlane (=2): _SamplingRadius
+
+	float scaledLEDBoidRadius = LEDBoidRadiusFromYAxis * _SamplingRadius / 2.0;
+
+	//  compute the cylinderic coordinate of nBoid to sample to get the color of pBoidLED
+
+   // get the y (height) of nBoid whose color to sample as the color of pBoidLED
+	// y^2 + LEDBoidRadiusFromYAxis = _MaxDomainRadius^2
+
+	//float yCoord = sqrt(_MaxDomainRadius * _MaxDomainRadius - LEDBoidRadiusFromYAxis * LEDBoidRadiusFromYAxis);
+
+	float yCoord = sqrt(_MaxDomainRadius * _MaxDomainRadius - scaledLEDBoidRadius * scaledLEDBoidRadius);
+
+	// get the phi coordinate;
+
+	float phi = findPhiAngleForVector(pBoidLED.position);
+	//float xCoord = LEDBoidRadiusFromYAxis * cos(phi);
+	float xCoord = scaledLEDBoidRadius * cos(phi);
+	
+	float zCoord = scaledLEDBoidRadius * sin(phi);
+	float3 BoidPosToSample = float3(xCoord, yCoord, zCoord);
+
+
+	//float3 posInCeiling =  pBoidLED.position;
+	for (int nId = 0; nId < _BoidsNum; nId++)
+	{
+		Boid nBoid = _BoidBuffer[nId];
+
+		if (nBoid.position.y < pBoidLED.position.y) continue;
+		// check if the boid nBoid is a neighbor of BoidPosToSample  
+		// within the sampling radius
+		diffVec = nBoid.position - BoidPosToSample;
+
+		dist = length(diffVec);
+
+		//if (dist <= _SamplingRadius)
+
+		if (dist <=  _MaxDomainRadius * 0.2 )
+		{
+			if (dist < minDist)
+			{
+				minDist = dist;
+				minIndex = nId;
+			}
+
+			neighborCnt++;
+
+		}// if (dist <=  _MaxDomainRadius * 0.2)
+		else continue;
+
+	} // for
+
+	//// The scan over the neighbots is finished
+
+	if (minIndex == -1) // no boid within the sampling radius
+	{ // no near boid; this does not happen because a boid is its own neigbor
+		_BoidLEDBuffer[pId].color = float4(0.0, 0.0, 0.0, 1.0);
+		//pBoidLED.color  = float4(1.0, 1.0, 1.0, 1.0);
+	}
+	else
+	{
+		_BoidLEDBuffer[pId].color = _BoidBuffer[minIndex].color;
+		
+		_BoidLEDBuffer[pId].nearestBoidID = minIndex;
+		_BoidLEDBuffer[pId].neighborCount  = neighborCnt;
+		
+	}
+
+
+	return;
+} // SampleLEDColors()
+
